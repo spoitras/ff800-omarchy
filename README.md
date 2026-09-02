@@ -205,3 +205,9 @@ Confirm any class with `hyprctl clients -j` before adding a rule.
 - [jack2](https://archlinux.org/packages/extra/x86_64/jack2/) · [pipewire-jack-client](https://archlinux.org/packages/extra/x86_64/pipewire-jack-client/)
 - [FFADO + PipeWire issues — Ardour forum](https://discourse.ardour.org/t/ffado-and-pipewire-issues-fireface-profire-40/110124)
 - [PipeWire](https://wiki.archlinux.org/title/PipeWire) · [JACK](https://wiki.archlinux.org/title/JACK_Audio_Connection_Kit) — ArchWiki
+
+---
+
+## License
+
+[MIT](LICENSE)
