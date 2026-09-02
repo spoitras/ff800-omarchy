@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "id": "spoitras.ff800",
+  "name": "Fireface 800",
+  "version": "1.0.0",
+  "author": "spoitras",
+  "license": "MIT",
+  "description": "Turn the RME Fireface 800 audio stack on and off from the Omarchy bar, with live jackd/FFADO status.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "shell/BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Fireface 800",
+    "description": "On/off switch for jackd + FFADO, with sample rate, buffer, DSP load, and xrun count.",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 15,
+      "command": "ff800",
+      "whenAbsent": "Show"
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 300,
+        "step": 1,
+        "defaultValue": 15
+      },
+      {
+        "key": "command",
+        "type": "string",
+        "label": "ff800 command",
+        "defaultValue": "ff800",
+        "description": "Looked up with ~/.local/bin prepended to PATH. Use an absolute path if it lives elsewhere."
+      },
+      {
+        "key": "whenAbsent",
+        "type": "enum",
+        "label": "Interface off the FireWire bus",
+        "options": ["Show", "Hide"],
+        "defaultValue": "Show",
+        "description": "Hide takes the widget out of the bar entirely while the FF800 is powered off."
+      }
+    ]
+  }
+}

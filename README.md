@@ -97,17 +97,125 @@ pipewire: active
 ## Usage
 
 ```sh
-ff800 on        # start jackd + attach PipeWire
-ff800 off       # stop cleanly
+ff800 on             # start jackd + attach PipeWire
+ff800 off            # stop cleanly
 ff800 status
-ff800 reset     # recover a wedged device
+ff800 status --json  # same, machine-readable (what the bar plugin polls)
+ff800 reset          # recover a wedged device
 ```
+
+`status` also reports the xrun count for the current jackd session, counted from
+the unit's journal and reset by every `ff800 on`.
 
 Nothing starts at boot, so a cold boot always has working audio whether the
 interface is on or not. `ff800 off` is always the way back.
 
 **Never `pkill jackd`** — an unclean exit wedges the controller and the next start
 fails. Use `ff800 off`.
+
+## Bar plugin
+
+This repo doubles as an Omarchy shell plugin: a bar widget that turns the stack
+on and off and shows what jackd is doing.
+
+```
+󰥛  ← bright when the stack is up, dimmed when it's down, red on a failed start
+```
+
+Clicking it opens a panel with the on/off switch, the numbers worth watching
+while tracking, and the three recovery actions from the troubleshooting table.
+
+```
+Fireface 800                    1 xrun   [ ●]
+48 KHZ · 128 FRAMES
+
+Device                          present on bus
+jackd                                   active
+Clock                               48000 Hz
+Buffer                     128 frames · 2.7 ms
+Ports                                       46
+DSP load                                 0.4 %
+Xruns                                        1
+PipeWire bridge                        enabled
+PipeWire                                active
+
+ACTIONS
+󰜉  Reset device     For a red HOST light or a wedged stream
+󰙪  Onboard mixer    Trims, hi-Z, zero-latency monitoring
+󰦛  Restart shell    Restores the bar's audio icon
+```
+
+The plugin never reimplements any of the logic above — it shells out to
+`ff800`, so the bar and the terminal can't disagree about what "on" means.
+
+### Install
+
+`ff800` itself must be installed first (steps 1–5). Then:
+
+```sh
+omarchy plugin add https://github.com/spoitras/ff800-omarchy.git
+omarchy plugin enable spoitras.ff800 --section right
+```
+
+Plugins land disabled so you can read the code before enabling — it runs
+unsandboxed inside `omarchy-shell`.
+
+Already have the repo checked out? Point the plugin directory at it instead:
+
+```sh
+ln -sfn "$PWD" ~/.config/omarchy/plugins/spoitras.ff800
+omarchy-shell shell rescanPlugins
+omarchy plugin enable spoitras.ff800 --section right
+```
+
+Note that the shell's file watcher doesn't follow that symlink, so edits need
+`omarchy restart shell` rather than hot-reloading.
+
+### Controls
+
+| Where | Action |
+|---|---|
+| Bar icon, left click | Open/close the panel |
+| Bar icon, right click | Refresh now |
+| Panel switch | `ff800 on` / `ff800 off` |
+| `↑` `↓` `Enter` | Move and activate the panel cursor |
+| `p` `r` `x` `m` | Power toggle · refresh · reset · mixer |
+
+Turning it on takes ~15 seconds (clock check, jackd start, PipeWire restart).
+The switch throws immediately and the panel says `Starting…` until the poll
+catches up. There is deliberately no power toggle on right-click — too easy to
+hit by accident for something that restarts PipeWire.
+
+### Settings
+
+Per-widget, on the plugin's entry in `~/.config/omarchy/shell.json`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `refreshIntervalSec` | `15` | Status poll interval. One poll costs ~45 ms |
+| `command` | `ff800` | Looked up with `~/.local/bin` prepended to `PATH` |
+| `whenAbsent` | `Show` | `Hide` drops the widget from the bar while the FF800 is powered off |
+
+### IPC
+
+```sh
+omarchy-shell ff800 toggle      # panel
+omarchy-shell ff800 power       # on/off
+omarchy-shell ff800 powerOn
+omarchy-shell ff800 powerOff
+omarchy-shell ff800 reset
+omarchy-shell ff800 refresh
+omarchy-shell ff800 state       # on | partial | off | absent | failed
+```
+
+Which makes a keybinding a one-liner in `~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + SHIFT + A", "Fireface 800", "omarchy-shell ff800 toggle")
+```
+
+`partial` means jackd is up but PipeWire isn't bridged to it: JACK clients have
+audio and the desktop doesn't.
 
 ## DAWs
 
@@ -156,7 +264,7 @@ Start with `ff800 off` — that restores normal desktop audio immediately.
 | Red **HOST** light | `ff800 reset` |
 | `No FireWire adapters (ports) found` | Device dropped off the bus — power-cycle it |
 | JACK nodes vanish | Something else took the device: `pgrep -f 'ffado-dbus-serve[r]'` |
-| Status-bar audio icon x-ed out | `omarchy restart shell` (PipeWire restart drops the bar's connection) |
+| Status-bar audio icon x-ed out | `omarchy restart shell` (PipeWire restart drops the bar's connection), or the plugin's **Restart shell** action |
 
 **Diagnose with libffado directly** — jackd's errors are vague, libffado's are not:
 

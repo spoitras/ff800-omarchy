@@ -27,7 +27,7 @@ device_present() {
     return 1
 }
 
-jack_info() {   # prints "<rate> Hz / <buffer> frames / <n> ports" or nothing
+jack_probe() {  # prints "<rate> <buffer> <ports> <dsp%>" or nothing
     # MUST stay under timeout: jack_client_open never returns against a server
     # that is hung in the FFADO device open, which is a real failure mode here.
     timeout 10 python3 - <<'PY' 2>/dev/null
@@ -38,15 +38,64 @@ lib.jack_client_open.restype=ctypes.c_void_p
 lib.jack_client_open.argtypes=[ctypes.c_char_p,ctypes.c_int,ctypes.c_void_p]
 lib.jack_get_sample_rate.restype=ctypes.c_uint32; lib.jack_get_sample_rate.argtypes=[ctypes.c_void_p]
 lib.jack_get_buffer_size.restype=ctypes.c_uint32; lib.jack_get_buffer_size.argtypes=[ctypes.c_void_p]
+lib.jack_cpu_load.restype=ctypes.c_float; lib.jack_cpu_load.argtypes=[ctypes.c_void_p]
 lib.jack_get_ports.restype=ctypes.POINTER(ctypes.c_char_p)
 lib.jack_get_ports.argtypes=[ctypes.c_void_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_ulong]
 c=lib.jack_client_open(b"ff800-status",1,None)   # 1 = JackNoStartServer
 if not c: raise SystemExit
 p=lib.jack_get_ports(ctypes.c_void_p(c),None,None,0); i=0
 while p and p[i]: i+=1
-print(f"{lib.jack_get_sample_rate(c)} Hz / {lib.jack_get_buffer_size(c)} frames / {i} ports")
+print(f"{lib.jack_get_sample_rate(c)} {lib.jack_get_buffer_size(c)} {i} {lib.jack_cpu_load(ctypes.c_void_p(c)):.1f}")
 lib.jack_client_close(ctypes.c_void_p(c))
 PY
+}
+
+jack_info() {   # prints "<rate> Hz / <buffer> frames / <n> ports" or nothing
+    local rate buf ports dsp
+    read -r rate buf ports dsp < <(jack_probe)
+    [ -n "$rate" ] && echo "$rate Hz / $buf frames / $ports ports"
+}
+
+# jackd logs every xrun it notices; scoping the grep to the unit's current
+# InvocationID keeps the count per-session instead of per-boot, so `ff800 on`
+# always starts from zero.
+xrun_count() {
+    local inv count
+    inv=$(systemctl --user show -p InvocationID --value "$SVC" 2>/dev/null)
+    [ -n "$inv" ] || { echo 0; return; }
+    count=$(journalctl --user "_SYSTEMD_INVOCATION_ID=$inv" --no-pager -o cat 2>/dev/null \
+              | grep -ci xrun)
+    echo "${count:-0}"
+}
+
+# One-line machine-readable status, for the Omarchy bar plugin and anything
+# else that would rather not parse the human output.
+status_json() {
+    local dev jackd pw bridge rate buf ports dsp xruns state probe
+    device_present && dev=true || dev=false
+    jackd=$(systemctl --user is-active "$SVC" 2>/dev/null)
+    pw=$(systemctl --user is-active pipewire 2>/dev/null)
+    [ -L "$CONFD/$TUNNEL" ] && bridge=true || bridge=false
+    rate=0; buf=0; ports=0; dsp=0; xruns=0
+    if [ "$jackd" = active ]; then
+        probe=$(jack_probe)
+        [ -n "$probe" ] && read -r rate buf ports dsp <<<"$probe"
+        xruns=$(xrun_count)
+    fi
+    # "partial" is jackd up but either unreachable or not bridged to PipeWire:
+    # audio works for JACK clients and not for the desktop, which is worth
+    # showing differently from a clean on/off.
+    if   [ "$jackd" = failed ];                     then state=failed
+    elif [ "$jackd" = active ] && [ "$rate" != 0 ]; then
+        [ "$bridge" = true ] && state=on || state=partial
+    elif [ "$jackd" = active ];                     then state=partial
+    elif [ "$dev" = false ];                        then state=absent
+    else                                                 state=off
+    fi
+    printf '{"state":"%s","device":%s,"jackd":"%s","pipewire":"%s","bridge":%s,' \
+        "$state" "$dev" "$jackd" "$pw" "$bridge"
+    printf '"rate":%s,"buffer":%s,"ports":%s,"dsp":%s,"xruns":%s}\n' \
+        "$rate" "$buf" "$ports" "$dsp" "$xruns"
 }
 
 # The FF800 does NOT reliably retain its clock mode across a power cycle: it
@@ -142,12 +191,16 @@ case "${1:-status}" in
     fi
     ;;
   status)
+    if [ "${2:-}" = "--json" ]; then status_json; exit 0; fi
     device_present && echo "device  : present on bus" || echo "device  : ABSENT (powered off?)"
-    echo "jackd   : $(systemctl --user is-active $SVC)"
+    jackd=$(systemctl --user is-active "$SVC")
+    echo "jackd   : $jackd"
     info=$(jack_info); [ -n "$info" ] && echo "jack    : $info"
+    [ "$jackd" = active ] && echo "xruns   : $(xrun_count)"
     [ -L "$CONFD/$TUNNEL" ] && echo "bridge  : enabled" || echo "bridge  : disabled"
     echo "pipewire: $(systemctl --user is-active pipewire)"
     wpctl status 2>/dev/null | grep -i 'JACK' | sed 's/^/          /' || true
     ;;
-  *) echo "usage: ff800 {on|off|status|reset}" >&2; exit 2 ;;
+  json) status_json ;;
+  *) echo "usage: ff800 {on|off|status [--json]|json|reset}" >&2; exit 2 ;;
 esac
