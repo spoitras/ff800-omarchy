@@ -1,0 +1,21 @@
+[Unit]
+Description=JACK server for RME Fireface 800 (FFADO backend)
+Documentation=man:jackd(1) man:ffado-test(1)
+
+[Service]
+Type=simple
+# 48000/128 matches the measured-good settings; -P 93 is the RT priority
+# libffado requests internally.
+ExecStart=/usr/bin/jackd -R -P 93 -d firewire -r 48000 -p 128 -n 3
+# systemd user services do NOT inherit the PAM limits from
+# /etc/security/limits.d, so the realtime limits must be set explicitly here or
+# jackd silently falls back to non-RT and FFADO fails to open the device.
+# libffado requests priority 98 internally (higher than jackd's own -P 93),
+# so this cap must exceed 98 or the device open fails with EPERM.
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+# Never auto-restart: if the interface is off, retry loops just hammer the bus.
+Restart=no
+
+[Install]
+WantedBy=default.target

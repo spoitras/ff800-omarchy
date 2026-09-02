@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# Manage the RME Fireface 800 audio stack on Omarchy.
+#
+# Architecture: jackd owns the FF800 through its FFADO backend and holds the
+# hardware stream open for the server's whole lifetime. PipeWire attaches as an
+# ordinary JACK client via module-jack-tunnel.
+#
+# This deliberately avoids libpipewire-module-ffado-driver, which has a
+# use-after-free between its data loop (ffado_streaming_wait) and teardown
+# (ffado_streaming_finish). PipeWire closes hardware streams whenever the last
+# client disconnects -- by design -- so that path crashed the whole PipeWire
+# process, and with it all system audio, every time playback ended.
+
+set -uo pipefail
+AVAIL="$HOME/.config/pipewire/ffado-available"
+CONFD="$HOME/.config/pipewire/pipewire.conf.d"
+TUNNEL=30-jack-tunnel.conf
+SVC=jackd-ff800.service
+RME_VENDOR="0x000a35"
+GUID=000a35005b685205
+
+device_present() {
+    for d in /sys/bus/firewire/devices/fw*; do
+        [ -r "$d/vendor" ] || continue
+        [ "$(cat "$d/vendor" 2>/dev/null)" = "$RME_VENDOR" ] && return 0
+    done
+    return 1
+}
+
+jack_info() {   # prints "<rate> Hz / <buffer> frames / <n> ports" or nothing
+    # MUST stay under timeout: jack_client_open never returns against a server
+    # that is hung in the FFADO device open, which is a real failure mode here.
+    timeout 10 python3 - <<'PY' 2>/dev/null
+import ctypes
+try: lib=ctypes.CDLL("libjack.so.0")
+except OSError: raise SystemExit
+lib.jack_client_open.restype=ctypes.c_void_p
+lib.jack_client_open.argtypes=[ctypes.c_char_p,ctypes.c_int,ctypes.c_void_p]
+lib.jack_get_sample_rate.restype=ctypes.c_uint32; lib.jack_get_sample_rate.argtypes=[ctypes.c_void_p]
+lib.jack_get_buffer_size.restype=ctypes.c_uint32; lib.jack_get_buffer_size.argtypes=[ctypes.c_void_p]
+lib.jack_get_ports.restype=ctypes.POINTER(ctypes.c_char_p)
+lib.jack_get_ports.argtypes=[ctypes.c_void_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_ulong]
+c=lib.jack_client_open(b"ff800-status",1,None)   # 1 = JackNoStartServer
+if not c: raise SystemExit
+p=lib.jack_get_ports(ctypes.c_void_p(c),None,None,0); i=0
+while p and p[i]: i+=1
+print(f"{lib.jack_get_sample_rate(c)} Hz / {lib.jack_get_buffer_size(c)} frames / {i} ports")
+lib.jack_client_close(ctypes.c_void_p(c))
+PY
+}
+
+# The FF800 does NOT reliably retain its clock mode across a power cycle: it
+# comes back in slave/AutoSync mode, and with no external clock connected it
+# then refuses to set its sample rate, so jackd fails with
+#   "FFADO: Error creating virtual device"
+# and libffado reports
+#   "slave clock mode active but no valid external clock present".
+# Force it back to master before every start. Mixer access (ffado-dbus-server)
+# is separate from streaming access, so this is safe to do here.
+# NOTE: "ffado-dbus-server" is 17 chars, over pgrep/pkill's 15-char comm limit,
+# so these must match on the full command line, with a bracket to avoid
+# matching this script's own command line.
+DBUS_PAT='ffado-dbus-serve[r]'
+
+ensure_master_clock() {
+    local started=0
+    if ! pgrep -f "$DBUS_PAT" >/dev/null; then
+        setsid ffado-dbus-server >/dev/null 2>&1 </dev/null &
+        started=1
+        sleep 8
+    fi
+    timeout 30 python3 - "$GUID" <<'PYEOF'
+import sys, dbus
+guid = sys.argv[1]
+base = f'/org/ffado/Control/DeviceManager/{guid}/Control/'
+try:
+    o = dbus.SessionBus().get_object('org.ffado.Control', base + 'Clock_mode')
+    i = dbus.Interface(o, 'org.ffado.Control.Element.Discrete')
+    if int(i.getValue()) != 0:
+        i.setValue(0)
+        print("ff800: clock mode was slave -> set to master")
+except Exception as e:
+    print(f"ff800: could not check clock mode ({e})", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+    local rc=$?
+    # Always release the device before jackd opens it.
+    [ "$started" = "1" ] && { pkill -f "$DBUS_PAT" 2>/dev/null; sleep 3; }
+    return $rc
+}
+
+restart_pipewire() {
+    systemctl --user reset-failed pipewire pipewire-pulse wireplumber 2>/dev/null
+    systemctl --user restart pipewire pipewire-pulse wireplumber
+    sleep 4
+}
+
+case "${1:-status}" in
+  on)
+    if ! device_present; then
+        echo "ff800: interface is not on the FireWire bus -- power it on first." >&2
+        exit 1
+    fi
+    ensure_master_clock || echo "ff800: clock check failed; starting anyway" >&2
+    systemctl --user reset-failed "$SVC" 2>/dev/null
+    systemctl --user start "$SVC"
+    sleep 6
+    if [ "$(systemctl --user is-active "$SVC")" != "active" ]; then
+        echo "ff800: jackd failed to start. Recent log:" >&2
+        journalctl --user -u "$SVC" -n 6 --no-pager -o cat 2>&1 \
+          | sed 's/\x1b\[[0-9;]*m//g; s/^/       /' >&2
+        echo "       If it segfaulted or reports a busy/enabled stream, the device" >&2
+        echo "       is wedged from an unclean exit -- run: ff800 reset" >&2
+        exit 1
+    fi
+    ln -sfn "$AVAIL/$TUNNEL" "$CONFD/$TUNNEL"
+    restart_pipewire
+    echo "ff800: on -- jack $(jack_info)"
+    wpctl status 2>/dev/null | grep -i 'JACK' | sed 's/^/       /'
+    ;;
+  off)
+    rm -f "$CONFD/$TUNNEL"
+    restart_pipewire
+    # Graceful SIGTERM via systemd. Never pkill jackd: an unclean exit leaves
+    # isochronous handlers allocated on the controller, and the next open then
+    # segfaults with "Enable requested on enabled stream".
+    systemctl --user stop "$SVC"
+    sleep 2
+    echo "ff800: off -- jackd $(systemctl --user is-active $SVC), pipewire $(systemctl --user is-active pipewire)"
+    ;;
+  reset)
+    # Recover a device wedged by an unclean exit (red HOST light, "stream
+    # enabled" errors, jackd segfault on start).
+    systemctl --user stop "$SVC" 2>/dev/null; sleep 2
+    ffado-test BusReset >/dev/null 2>&1 && echo "ff800: bus reset ok" || echo "ff800: bus reset FAILED" >&2
+    sleep 5
+    if ffado-test ListDevices 2>/dev/null | grep -qi 'Fireface'; then
+        echo "ff800: device visible again -- run 'ff800 on'"
+    else
+        echo "ff800: device still not visible; power-cycle the interface." >&2
+        exit 1
+    fi
+    ;;
+  status)
+    device_present && echo "device  : present on bus" || echo "device  : ABSENT (powered off?)"
+    echo "jackd   : $(systemctl --user is-active $SVC)"
+    info=$(jack_info); [ -n "$info" ] && echo "jack    : $info"
+    [ -L "$CONFD/$TUNNEL" ] && echo "bridge  : enabled" || echo "bridge  : disabled"
+    echo "pipewire: $(systemctl --user is-active pipewire)"
+    wpctl status 2>/dev/null | grep -i 'JACK' | sed 's/^/          /' || true
+    ;;
+  *) echo "usage: ff800 {on|off|status|reset}" >&2; exit 2 ;;
+esac
