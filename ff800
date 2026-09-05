@@ -19,6 +19,14 @@ SVC=jackd-ff800.service
 RME_VENDOR="0x000a35"
 GUID=000a35005b685205
 
+# Everything `ff800 on` decides also goes to the journal. The bar plugin
+# collects stdout into a QML string and discards it on success, so a start that
+# failed and recovered left no record of *why* anywhere -- which is exactly the
+# run you want to read afterwards. `ff800 log` prints it back.
+say()  { echo "$*";     logger -t ff800 -- "$*" 2>/dev/null; }
+warn() { echo "$*" >&2; logger -t ff800 -p user.warning -- "$*" 2>/dev/null; }
+note() {                logger -t ff800 -- "$*" 2>/dev/null; }   # journal only
+
 device_present() {
     for d in /sys/bus/firewire/devices/fw*; do
         [ -r "$d/vendor" ] || continue
@@ -111,60 +119,195 @@ status_json() {
 # matching this script's own command line.
 DBUS_PAT='ffado-dbus-serve[r]'
 
+# Settle time after a clock-mode change, before jackd may open the device.
+#
+# MEASURED 2026-09-05, and it is NOT what fixes the first-start failure. A run
+# with a read-back-verified write to master and a full 12s settle still failed
+# the open in 1s -- and the next clock check, 13s later, found the mode back on
+# slave with nothing but that failed open in between. Both attempts of that run
+# were structurally identical (write, stop daemon, settle, start); the only
+# thing distinguishing the one that worked is that a failed FFADO open preceded
+# it. So the first open after a power cycle fails regardless, and the retry
+# below is what actually recovers the start.
+#
+# Kept small rather than removed because no run has yet tried zero. To measure:
+#   FF800_CLOCK_SETTLE=0 ff800 on   # then: ff800 log
+CLOCK_SETTLE=${FF800_CLOCK_SETTLE:-3}
+
+stop_dbus_server() {
+    pkill -f "$DBUS_PAT" 2>/dev/null
+    # Wait for it to actually let go: jackd's open fails outright if anything
+    # else still holds the device, and SIGTERM is not instant here.
+    local i
+    for i in $(seq 10); do
+        pgrep -f "$DBUS_PAT" >/dev/null || return 0
+        sleep 1
+    done
+    warn "ff800: ffado-dbus-server ignored SIGTERM; killing it"
+    pkill -9 -f "$DBUS_PAT" 2>/dev/null
+    sleep 2
+}
+
+# 0 = already on master, 10 = was slave and has been switched (the caller must
+# let the device settle before opening it), 1 = could not tell.
+#
+# ffado-dbus-server is D-Bus activatable (/usr/share/dbus-1/services/
+# org.ffado.Control.service), so the call below starts it by itself -- no need
+# to spawn it here and then guess with a blind sleep how long discovery takes.
+# What we do have to do is put things back the way we found them: a daemon that
+# was not running before must not be left holding the device when jackd opens
+# it, and D-Bus will happily activate one behind our back.
 ensure_master_clock() {
-    local started=0
-    if ! pgrep -f "$DBUS_PAT" >/dev/null; then
-        setsid ffado-dbus-server >/dev/null 2>&1 </dev/null &
-        started=1
-        sleep 8
-    fi
-    timeout 30 python3 - "$GUID" <<'PYEOF'
-import sys, dbus
+    local pre=0 out rc
+    pgrep -f "$DBUS_PAT" >/dev/null && pre=1
+    out=$(timeout 45 python3 - "$GUID" <<'PYEOF' 2>&1
+import sys, time, dbus
 guid = sys.argv[1]
-base = f'/org/ffado/Control/DeviceManager/{guid}/Control/'
-try:
-    o = dbus.SessionBus().get_object('org.ffado.Control', base + 'Clock_mode')
-    i = dbus.Interface(o, 'org.ffado.Control.Element.Discrete')
-    if int(i.getValue()) != 0:
-        i.setValue(0)
-        print("ff800: clock mode was slave -> set to master")
-except Exception as e:
-    print(f"ff800: could not check clock mode ({e})", file=sys.stderr)
+path = f'/org/ffado/Control/DeviceManager/{guid}/Control/Clock_mode'
+bus = dbus.SessionBus()
+# The service claims its bus name before it has finished enumerating the
+# FireWire bus, so the control object shows up a few seconds after activation.
+deadline = time.time() + 30
+while True:
+    try:
+        i = dbus.Interface(bus.get_object('org.ffado.Control', path),
+                           'org.ffado.Control.Element.Discrete')
+        value = int(i.getValue())
+        break
+    except dbus.DBusException as e:
+        if time.time() > deadline:
+            print(f"ff800: no clock control after 30s ({e})", file=sys.stderr)
+            sys.exit(1)
+        time.sleep(1)
+if value == 0:
+    sys.exit(0)
+i.setValue(0)
+# Read back: a write the device rejects is silent otherwise, and starting jackd
+# against a still-slave clock only reproduces the original failure.
+if int(i.getValue()) != 0:
+    print("ff800: clock mode would not switch to master", file=sys.stderr)
     sys.exit(1)
+print("ff800: clock mode was slave -> set to master")
+sys.exit(10)
 PYEOF
-    local rc=$?
-    # Always release the device before jackd opens it.
-    [ "$started" = "1" ] && { pkill -f "$DBUS_PAT" 2>/dev/null; sleep 3; }
+)
+    rc=$?
+    [ -n "$out" ] && say "$out"
+    # Always release the device before jackd opens it -- unless it was already
+    # running, in which case it is someone else's (ffado-mixer, typically).
+    [ "$pre" = 0 ] && stop_dbus_server
     return $rc
 }
 
+# Run the clock check and absorb the relock wait it may ask for.
+prepare_clock() {
+    local t0=$SECONDS rc
+    ensure_master_clock
+    rc=$?
+    note "ff800: clock check took $((SECONDS - t0))s (rc=$rc)"
+    case "$rc" in
+        10) say "ff800: clock was slave -> master; letting it relock (${CLOCK_SETTLE}s)"
+            sleep "$CLOCK_SETTLE" ;;
+        0)  note "ff800: clock already master, no settle needed" ;;
+        *)  warn "ff800: clock check failed; starting anyway" ;;
+    esac
+    return "$rc"
+}
+
+jackd_log() {
+    journalctl --user -u "$SVC" -n 8 --no-pager -o cat 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
+}
+
+# A device wedged by an unclean exit needs `ff800 reset`, not another start.
+jackd_wedged() {
+    [ "$(systemctl --user show -p Result --value "$SVC" 2>/dev/null)" = core-dump ] && return 0
+    jackd_log | grep -qiE 'enabled stream|not busy|segmentation fault'
+}
+
+# One start attempt. A failed FFADO open gives up in under a second while a
+# good one needs ~7s to bring the ports up, so poll rather than sleep blind:
+# failure is noticed immediately and success means the server actually answered.
+start_jackd() {
+    local i t0=$SECONDS
+    systemctl --user reset-failed "$SVC" 2>/dev/null
+    systemctl --user start "$SVC" || { warn "ff800: systemctl start failed"; return 1; }
+    for i in $(seq 80); do          # 80 * 0.25s = 20s
+        sleep 0.25
+        if [ "$(systemctl --user is-active "$SVC")" != active ]; then
+            note "ff800: jackd open failed after $((SECONDS - t0))s -- $(jackd_log | grep -iEm1 'err|error' | tr -s ' ')"
+            return 1
+        fi
+        # Not before 2s, and every half second after that: a client open
+        # against a server whose driver is still attaching is wasted work.
+        if [ "$i" -ge 8 ] && [ $((i % 2)) -eq 0 ] && [ -n "$(jack_probe)" ]; then
+            note "ff800: jackd up after $((SECONDS - t0))s"
+            return 0
+        fi
+    done
+    note "ff800: jackd active but unreachable after $((SECONDS - t0))s"
+    return 1    # hung in the device open
+}
+
+# Returns once PipeWire is back -- and, when the bridge is linked, once the JACK
+# sink has actually appeared. Polling beats the blind sleep this used to do:
+# the sink is usually up in about a second, and on the rare slow restart four
+# seconds was not enough anyway.
 restart_pipewire() {
+    local i want_jack=0 last=-1 now
+    [ -L "$CONFD/$TUNNEL" ] && want_jack=1
     systemctl --user reset-failed pipewire pipewire-pulse wireplumber 2>/dev/null
     systemctl --user restart pipewire pipewire-pulse wireplumber
-    sleep 4
+    for i in $(seq 40); do          # up to 10s
+        sleep 0.25
+        [ "$(systemctl --user is-active pipewire)" = active ] || continue
+        [ "$want_jack" = 0 ] && return 0
+        wpctl status 2>/dev/null | grep -qi 'JACK' || continue
+        # The tunnel's ports finish registering a beat after the sink appears,
+        # so wait for the count to stop moving -- otherwise the summary line
+        # reports a number that is already stale by the time it is printed.
+        now=$(jack_probe | cut -d' ' -f3)
+        [ -n "$now" ] && [ "$now" = "$last" ] && return 0
+        last=${now:--1}
+    done
+    note "ff800: PipeWire did not settle within 10s"
 }
 
 case "${1:-status}" in
   on)
     if ! device_present; then
-        echo "ff800: interface is not on the FireWire bus -- power it on first." >&2
+        warn "ff800: interface is not on the FireWire bus -- power it on first."
         exit 1
     fi
-    ensure_master_clock || echo "ff800: clock check failed; starting anyway" >&2
-    systemctl --user reset-failed "$SVC" 2>/dev/null
-    systemctl --user start "$SVC"
-    sleep 6
-    if [ "$(systemctl --user is-active "$SVC")" != "active" ]; then
-        echo "ff800: jackd failed to start. Recent log:" >&2
-        journalctl --user -u "$SVC" -n 6 --no-pager -o cat 2>&1 \
-          | sed 's/\x1b\[[0-9;]*m//g; s/^/       /' >&2
-        echo "       If it segfaulted or reports a busy/enabled stream, the device" >&2
-        echo "       is wedged from an unclean exit -- run: ff800 reset" >&2
-        exit 1
+    # Open first, fix the clock only if that fails. The first open after a
+    # power cycle fails whatever the clock says, and it reverts the clock to
+    # slave on its way out -- so a clock check done *before* it is work whose
+    # result that open then throws away. Checking after failure instead saves a
+    # whole D-Bus round trip and settle on a cold start, and skips them
+    # entirely on a warm one, where the open just succeeds.
+    if ! start_jackd; then
+        # Decide before stopping the unit -- the stop clears its Result.
+        wedged=no; jackd_wedged && wedged=yes
+        systemctl --user stop "$SVC" 2>/dev/null
+        if [ "$wedged" = yes ]; then
+            warn "ff800: jackd failed to start (wedged device). Recent log:"
+            jackd_log | sed 's/^/       /' >&2
+            echo "       The device is wedged from an unclean exit -- run: ff800 reset" >&2
+            exit 1
+        fi
+        say "ff800: first open failed (expected after a power cycle) -- fixing clock, retrying"
+        prepare_clock
+        if ! start_jackd; then
+            systemctl --user stop "$SVC" 2>/dev/null
+            warn "ff800: jackd failed to start twice. Recent log:"
+            jackd_log | sed 's/^/       /' >&2
+            echo "       If it segfaulted or reports a busy/enabled stream, the device" >&2
+            echo "       is wedged from an unclean exit -- run: ff800 reset" >&2
+            exit 1
+        fi
     fi
     ln -sfn "$AVAIL/$TUNNEL" "$CONFD/$TUNNEL"
     restart_pipewire
-    echo "ff800: on -- jack $(jack_info)"
+    say "ff800: on -- jack $(jack_info)"
     wpctl status 2>/dev/null | grep -i 'JACK' | sed 's/^/       /'
     ;;
   off)
@@ -175,7 +318,7 @@ case "${1:-status}" in
     # segfaults with "Enable requested on enabled stream".
     systemctl --user stop "$SVC"
     sleep 2
-    echo "ff800: off -- jackd $(systemctl --user is-active $SVC), pipewire $(systemctl --user is-active pipewire)"
+    say "ff800: off -- jackd $(systemctl --user is-active $SVC), pipewire $(systemctl --user is-active pipewire)"
     ;;
   reset)
     # Recover a device wedged by an unclean exit (red HOST light, "stream
@@ -201,6 +344,20 @@ case "${1:-status}" in
     echo "pipewire: $(systemctl --user is-active pipewire)"
     wpctl status 2>/dev/null | grep -i 'JACK' | sed 's/^/          /' || true
     ;;
+  clock)
+    # `on` only touches the clock when an open fails, so this is the way to
+    # assert master by hand -- and to check it without starting anything.
+    prepare_clock
+    case "$?" in
+        0|10) echo "ff800: clock mode is master" ;;
+        *)    exit 1 ;;   # prepare_clock has already said why
+    esac
+    ;;
   json) status_json ;;
-  *) echo "usage: ff800 {on|off|status [--json]|json|reset}" >&2; exit 2 ;;
+  log)
+    # What the last starts actually did -- the only record when `on` was driven
+    # from the bar plugin rather than a terminal.
+    journalctl --user -t ff800 -n "${2:-40}" --no-pager -o short-iso 2>/dev/null
+    ;;
+  *) echo "usage: ff800 {on|off|status [--json]|json|clock|reset|log [n]}" >&2; exit 2 ;;
 esac
