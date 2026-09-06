@@ -74,11 +74,39 @@ it on demand.
 ffado-test ListDevices     # -> 0x000a35005b685205
 ```
 
-Put it in both `~/.config/pipewire/ffado-available/30-jack-tunnel.conf` (the two
-`firewire_pcm:<GUID>_pbk_analog-*_out` port names) and `~/.local/bin/ff800` (the
-`GUID=` line).
+Put it in both `~/.config/pipewire/ffado-available/30-jack-tunnel.conf` (the four
+`firewire_pcm:<GUID>_…` port names) and `~/.local/bin/ff800` (the `GUID=` line).
 
-## 6. Go
+## 6. Store master clock mode in the device flash — once
+
+The FF800 powers on with the settings in its flash, and libffado reloads those
+into the device on the first open after a power cycle. If the flash says
+slave/AutoSync, that first open fails (see [the gotcha](#first-start) for the
+mechanism). Fix it at the source, one time, with the interface on and jackd
+stopped:
+
+```sh
+ff800 off
+python3 - <<'PY'
+import dbus
+base = '/org/ffado/Control/DeviceManager/000a35005b685205/Control/'   # your GUID
+bus = dbus.SessionBus()
+ctl = lambda n: dbus.Interface(bus.get_object('org.ffado.Control', base + n),
+                               'org.ffado.Control.Element.Discrete')
+ctl('Clock_mode').setValue(0)       # 0 = master
+ctl('Flash_control').setValue(1)    # 1 = save control settings to flash (~1 s)
+ctl('Flash_control').setValue(0)    # 0 = reload from flash, to verify
+print('flash clock mode:', int(ctl('Clock_mode').getValue()), '(0 = master)')
+PY
+pkill -f 'ffado-dbus-serve[r]'
+```
+
+The D-Bus call activates `ffado-dbus-server` by itself. Same thing in
+`ffado-mixer`: set the clock to Master, then **Save control** in the *Flash*
+box. It stores the current sample rate and input/output levels too; that is
+what the interface will boot with from now on.
+
+## 7. Go
 
 ```sh
 ff800 on
@@ -158,7 +186,7 @@ The plugin never reimplements any of the logic above — it shells out to
 
 ### Install
 
-`ff800` itself must be installed first (steps 1–5). Then:
+`ff800` itself must be installed first (steps 1–6). Then:
 
 ```sh
 omarchy plugin add https://github.com/spoitras/ff800-omarchy.git
@@ -189,10 +217,11 @@ Note that the shell's file watcher doesn't follow that symlink, so edits need
 | `↑` `↓` `Enter` | Move and activate the panel cursor |
 | `p` `r` `x` `m` | Power toggle · refresh · reset · mixer |
 
-Turning it on takes ~4 seconds within a power cycle, or ~9 on the first start
-after one, which always spends a failed attempt, a clock fix and a retry. Both
-measured. Nothing is lost when it takes the slow path, but `ff800 log` is the
-only place it's recorded.
+Turning it on takes ~4 seconds. With slave clock in the device flash (before
+step 6) the first start after a power cycle took ~9, spending a failed attempt,
+a clock fix and a retry; `ff800 on` still does that whenever the first open
+fails. Both measured. Nothing is lost when it takes the slow path, but
+`ff800 log` is the only place it's recorded.
 The switch throws immediately and the panel says `Starting…` until the poll
 catches up. There is deliberately no power toggle on right-click — too easy to
 hit by accident for something that restarts PipeWire.
@@ -267,7 +296,7 @@ Start with `ff800 off` — that restores normal desktop audio immediately.
 
 | Symptom | Fix |
 |---|---|
-| `FFADO: Error creating virtual device` | Expected on the first open after a power cycle. `ff800 on` retries once and the second attempt works. Twice in a row means a wedged device — `ff800 reset` |
+| `FFADO: Error creating virtual device` | On the first open after a power cycle: the flash says slave clock — step 6. `ff800 on` retries once with the clock fixed and the second attempt works. Twice in a row means a wedged device — `ff800 reset` |
 | `Cannot create realtime thread ... priority: 98` | Missing RT privileges — step 3, and re-login |
 | `timeout waiting for device not busy` | `ff800 reset` |
 | `Enable requested on enabled stream` | `ff800 reset` |
@@ -291,74 +320,90 @@ throughput. A clean `pw-top` says nothing about the teardown path.
 
 ## Gotchas worth knowing
 
-**The FF800 forgets its clock mode on every power cycle.** It comes back in slave
-mode, and with no external clock connected it then refuses to set its sample
-rate. It also reverts whenever an FFADO open fails — see the next entry. `ff800
-on` fixes it *on demand*: it tries the open first and only touches the clock if
-that fails, because a check done beforehand is work the doomed first open throws
-away. `ff800 clock` forces master by hand without starting anything; by hand
-without that, set `Control/Clock_mode` to `0` over `ffado-dbus-server` and stop
-the daemon afterwards.
+<a name="first-start"></a>
+**The FF800's registers are write-only, so libffado keeps a shadow of the
+device state in shared memory.** It lives at `/dev/shm/ffado:rme_shm-<GUID>`,
+reference-counted, unlinked when the last user closes it. Everything below
+follows from three facts in the libffado 2.5.0 RME driver (`src/rme/`):
 
-With no external clock connected this loses nothing: a slave-clock open cannot
-succeed, so a start that comes up at all is a start on master.
+- Every D-Bus read, `Clock_mode` included, returns the shadow, not the device.
+  A "read back" proves only that the write reached shared memory.
+- A process that *creates* the segment initialises it from the device flash and
+  writes those flash settings back into the device (`init_hardware`). A process
+  that *attaches* to an existing segment does neither.
+- When streaming init fails, `ffado_streaming_init` returns without destroying
+  the device object, so the failed process never releases its reference. The
+  segment leaks and outlives it.
 
-**The first start after a power cycle always fails, and recovers by itself.**
-`ff800 on` retries once — the "just run it twice" workaround, done for you, in
-~9 s total:
-
-```
-12:34:48  jackd open failed after 0s -- FFADO: Error creating virtual device
-12:34:48  first open failed (expected after a power cycle) -- fixing clock, retrying
-12:34:48  clock mode was slave -> set to master
-12:34:49  clock check took 1s (rc=10)
-12:34:49  clock was slave -> master; letting it relock (3s)
-12:34:54  jackd up after 2s
-12:34:56  on -- jack 48000 Hz / 128 frames / 46 ports
-```
-
-A start that fails *twice*, or that reports a core dump or a busy/enabled
-stream, is a wedged device: `ff800 reset`.
-
-It is worth knowing what this is *not*, because two plausible explanations are
-both wrong. It is not a missing clock change: the mode is set to master and read
-back before the first attempt. And it is not the device needing time to relock
-afterwards — a run with a verified write and a full 12 s settle still failed the
-open in 1 s:
+**Why the first start after a power cycle failed, and why the retry worked.**
+With slave/AutoSync in the flash and no external clock connected:
 
 ```
-12:22:27  clock mode was slave -> set to master   write #1, read back as master
-12:22:29  clock check took 2s (rc=10)
-12:22:42  jackd open failed after 1s              after a full 12s settle
-12:22:42  clock mode was slave -> set to master   write #2: slave again, 13s later
-12:22:59  jackd up after 4s                       identical structure, worked
+20:00:37  jackd open failed after 0s -- FFADO: Error creating virtual device
+20:00:37  first open failed (expected after a power cycle) -- fixing clock, retrying
+20:00:37  clock mode was slave -> set to master
+20:00:38  clock was slave -> master; letting it relock (3s)
+20:00:43  jackd up after 2s
+20:00:45  on -- jack 48000 Hz / 128 frames / 46 ports
 ```
 
-Both attempts did the same thing in the same order with the same timings. The
-only difference is that a failed FFADO open preceded the one that worked — and
-note the clock reverting to slave in between, with nothing but that failed open
-touching the device. So the first open after a power cycle fails whatever the
-clock says, and having failed, leaves the device in a state the next open
-succeeds against. The retry is the fix; the clock write and the settle are not
-doing the work. `CLOCK_SETTLE` is 3 s and overridable
-(`FF800_CLOCK_SETTLE=0 ff800 on`) precisely because it has never been shown to
-matter.
+1. `ff800 on` opens first. jackd creates a fresh segment, reloads slave from
+   the flash into the device, and libffado refuses the sample rate: "slave clock
+   mode active but no valid external clock present". jackd exits — and leaks
+   the segment.
+2. The clock check attaches to that leaked segment, reads slave, writes master
+   to shadow and device. Stopping the D-Bus daemon drops *its* reference; the
+   leaked one keeps the segment alive.
+3. The retry attaches to the same segment. `settings_valid` is already set, so
+   the flash is not consulted, the clock stays master, and the open succeeds.
 
-**Restarts within the same power cycle are cheap.** Only the *failed* open
-reverts the clock; a clean `ff800 off` leaves it on master, so the next `ff800
-on` opens the device first time and never talks to D-Bus at all — **3.8 s
-measured**, against ~11 s before the open-first reorder.
+So the clock write *is* what fixes the start. It only ever needed a segment
+that survives until jackd opens, and the failure in step 1 is what accidentally
+provided one. This also explains the experiment that seemed to prove the
+opposite — master written and "read back", a 12 s settle, and a failed open
+regardless: the daemon was the segment's only user, so stopping it unlinked the
+segment and discarded the write; jackd then created a fresh one and reloaded
+slave from the flash. The read-back was the shadow. Confirmed on the live
+system after the run above: the segment's birth time was the second of the
+failed open, and its reference count read 3 with two live users.
 
-Which is the practical rule: pay the retry once per power cycle, never again
-until you switch the interface off.
+**The permanent fix is master in the flash (step 6).** A fresh segment then
+loads master, and the first open should succeed cold with no D-Bus round trip.
+`ff800 on` keeps the retry as a fallback. The settle after the clock write has
+no role in this mechanism; it stays overridable (`FF800_CLOCK_SETTLE=0 ff800 on`)
+and is a candidate for removal.
+
+*Not yet verified cold on this machine.* The leaked segment from the last
+failed open survives until a host reboot, and while it exists jackd never
+reads the flash. To test: `ff800 off`, make sure no `ffado-dbus-server` is
+running, remove `/dev/shm/ffado:rme_shm-<GUID>`, power-cycle the interface,
+`ff800 on`.
+
+**Restarts within the same power cycle are cheap** because the leaked segment
+keeps master alive, not because the device remembers anything. A clean `ff800
+off` releases jackd's reference, the leaked one stays, and the next `ff800 on`
+attaches and opens first time — **3.8 s measured**, no D-Bus at all.
+
+**Two consequences worth knowing.** Power-cycling the *interface* without
+rebooting the host leaves the shadow saying master while the device has
+reloaded its flash; with slave in the flash, the clock check then reports
+"already master" and repairs nothing — one more reason to fix the flash. And
+after an unclean jackd exit the leaked shadow keeps `is_streaming = 1`, which
+makes libffado skip the stream-start register on the next open; a stale segment
+is a plausible part of what `ff800 reset` is recovering from. Removing it, with
+jackd and `ffado-dbus-server` both stopped, is safe — the next process recreates
+it from the flash.
 
 **`ffado-dbus-server` is D-Bus activatable.** `/usr/share/dbus-1/services/
 org.ffado.Control.service` means any client that talks to `org.ffado.Control` —
 including `ff800`'s own clock check — starts the daemon. So `ff800` no longer
 spawns it by hand behind a blind `sleep 8`; it just makes the call, polls until
 the control object appears (~1 s, versus 11 s before), and stops the daemon
-again *only if it wasn't already running*. A daemon left behind by an incidental
-activation is one more thing holding the device when `jackd` tries to open it.
+again *only if it wasn't already running*. Mixer access and streaming don't
+conflict — an incidentally activated daemon has run alongside jackd here without
+effect — so this is tidiness, not necessity. Note the flip side: if that daemon
+is the shared-memory segment's only user, stopping it also discards the shadow,
+clock write included. See above.
 
 **`LimitRTPRIO` in the service must exceed 98.** libffado internally requests
 priority 98 — higher than the 93 passed to `jackd` — so a cap of 95 looks generous
