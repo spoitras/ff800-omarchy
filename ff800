@@ -305,6 +305,7 @@ case "${1:-status}" in
             exit 1
         fi
     fi
+    mkdir -p "$CONFD"
     ln -sfn "$AVAIL/$TUNNEL" "$CONFD/$TUNNEL"
     restart_pipewire
     say "ff800: on -- jack $(jack_info)"
