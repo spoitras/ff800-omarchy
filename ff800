@@ -148,6 +148,52 @@ stop_dbus_server() {
     sleep 2
 }
 
+# ffado-dbus-server (and the ffado-mixer talking to it) binds to the FireWire
+# device node once, at start, and never re-attaches. Any bus reset that
+# re-creates the node -- `ff800 reset`, a power cycle, sometimes a jackd crash --
+# leaves it logging "readBlock ... failed" ten times a second while the mixer
+# looks alive and does nothing. Measured 2026-10-02. It also holds libffado's
+# shared settings object open (below), so it has to go for that reason too.
+MIXER_PAT='/usr/bin/ffado-mixe[r]'
+SHM="/dev/shm/ffado:rme_shm-$GUID"
+
+# Stop the control side; prints "1" if a mixer window was open, so the caller
+# can bring it back against a fresh server.
+release_control() {
+    local had_mixer=0
+    if pgrep -f "$MIXER_PAT" >/dev/null; then
+        had_mixer=1
+        pkill -f "$MIXER_PAT" 2>/dev/null
+    fi
+    pgrep -f "$DBUS_PAT" >/dev/null && stop_dbus_server
+    echo "$had_mixer"
+}
+
+reopen_mixer() {
+    [ "${1:-0}" = 1 ] || return 0
+    setsid -f uwsm-app -- ffado-mixer >/dev/null 2>&1 \
+        || setsid -f ffado-mixer >/dev/null 2>&1
+    note "ff800: reopened ffado-mixer against a fresh control server"
+}
+
+# libffado's RME driver keeps the device config in POSIX shm shared by every
+# FFADO process, with a "settings_valid" flag. While that flag is set, a new
+# process skips init_hardware() -- the step that loads the flash settings into
+# the device and puts out the red HOST LED. The object is only unlinked when
+# its ref_count reaches zero, and a jackd that crashes on stop (libffado's
+# IsoHandler teardown race) never decrements it: seen at ref_count 3 with two
+# live users. From then on the flag outlives every power cycle until reboot, so
+# the interface is never re-initialised and the HOST LED stays on.
+# Unlinking it when nothing maps it is exactly what a clean last close does.
+clear_stale_shm() {
+    [ -e "$SHM" ] || return 0
+    if grep -qs "rme_shm-$GUID" /proc/[0-9]*/maps; then
+        note "ff800: libffado shared state still in use; left alone"
+        return 0
+    fi
+    rm -f "$SHM" && note "ff800: cleared stale libffado shared state"
+}
+
 # 0 = already on master, 10 = was slave and has been switched (the caller must
 # let the device settle before opening it), 1 = could not tell.
 #
@@ -284,6 +330,15 @@ case "${1:-status}" in
     # result that open then throws away. Checking after failure instead saves a
     # whole D-Bus round trip and settle on a cold start, and skips them
     # entirely on a warm one, where the open just succeeds.
+    #
+    # Before any of that, start jackd from a clean slate: no control server
+    # bound to a device node that may be gone, and no shared settings object
+    # that would make jackd skip initialising the interface.
+    mixer_was_open=0
+    if [ "$(systemctl --user is-active "$SVC")" != active ]; then
+        mixer_was_open=$(release_control)
+        clear_stale_shm
+    fi
     if ! start_jackd; then
         # Decide before stopping the unit -- the stop clears its Result.
         wedged=no; jackd_wedged && wedged=yes
@@ -310,6 +365,7 @@ case "${1:-status}" in
     restart_pipewire
     say "ff800: on -- jack $(jack_info)"
     wpctl status 2>/dev/null | grep -i 'JACK' | sed 's/^/       /'
+    reopen_mixer "$mixer_was_open"
     ;;
   off)
     rm -f "$CONFD/$TUNNEL"
@@ -319,12 +375,19 @@ case "${1:-status}" in
     # segfaults with "Enable requested on enabled stream".
     systemctl --user stop "$SVC"
     sleep 2
+    # Leaves an open mixer alone (it still works without streaming), but if
+    # jackd was the last user, make sure its settings go with it.
+    clear_stale_shm
     say "ff800: off -- jackd $(systemctl --user is-active $SVC), pipewire $(systemctl --user is-active pipewire)"
     ;;
   reset)
     # Recover a device wedged by an unclean exit (red HOST light, "stream
     # enabled" errors, jackd segfault on start).
     systemctl --user stop "$SVC" 2>/dev/null; sleep 2
+    # The bus reset below orphans any running control server, and a stale
+    # shared settings object is what keeps the HOST light on across resets.
+    release_control >/dev/null
+    clear_stale_shm
     ffado-test BusReset >/dev/null 2>&1 && echo "ff800: bus reset ok" || echo "ff800: bus reset FAILED" >&2
     sleep 5
     if ffado-test ListDevices 2>/dev/null | grep -qi 'Fireface'; then
